@@ -23,8 +23,8 @@ class ManageApiController extends Controller
             DB::beginTransaction();
 
             AiProvider::create([
-                'slug' => strtolower($request->slug),
-                'default_model' => $request->default_model,
+                'slug' => strtolower(trim($request->slug)),
+                'default_model' => trim($request->default_model),
             ]);
 
             DB::commit();
@@ -43,8 +43,8 @@ class ManageApiController extends Controller
 
             $provider = AiProvider::findOrFail($id_provider);
             $provider->update([
-                'slug' => strtolower($request->slug),
-                'default_model' => $request->default_model,
+                'slug' => strtolower(trim($request->slug)),
+                'default_model' => trim($request->default_model),
             ]);
 
             DB::commit();
@@ -85,11 +85,10 @@ class ManageApiController extends Controller
                 ->where('priority', '>=', $targetPriority)
                 ->increment('priority');
 
-            // Gunakan trim() untuk memastikan string API Key bersih dari spasi/karakter tersembunyi
             ApiKey::create([
                 'id_provider' => $id_provider,
                 'name' => trim($request->name),
-                'encrypted_key' => trim($request->encrypted_key),
+                'encrypted_key' => trim($request->encrypted_key), // Mutator Model menangani enkripsi
                 'priority' => $targetPriority,
                 'rate_limit' => $request->rate_limit,
                 'status' => 'ready',
@@ -122,13 +121,13 @@ class ManageApiController extends Controller
             }
 
             $updateData = [
-                'name' => $request->name,
+                'name' => trim($request->name),
                 'priority' => $newPriority,
                 'rate_limit' => $request->rate_limit,
             ];
 
             if ($request->filled('encrypted_key')) {
-                $updateData['encrypted_key'] = $request->encrypted_key;
+                $updateData['encrypted_key'] = trim($request->encrypted_key);
             }
 
             $apiKey->update($updateData);

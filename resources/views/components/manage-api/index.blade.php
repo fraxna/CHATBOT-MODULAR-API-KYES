@@ -9,27 +9,151 @@ use Carbon\Carbon;
 new class extends Component {
     use WithPagination;
 
+    // Model State untuk Edit API Key Modal
+    public $editingKeyId = null;
+    public $edit_name = '';
+    public $edit_key = '';
+    public $edit_priority = 1;
+    public $edit_rate_limit = 60;
+
+    // Model State untuk Create Provider Inline
+    public $new_provider_slug = '';
+    public $new_provider_default_model = '';
+
+    // Model State untuk Create API Key Inline (Per Provider)
+    public $new_key_name = '';
+    public $new_key_string = '';
+    public $new_key_priority = 1;
+    public $new_key_rate_limit = 60;
+
+    protected function rules(): array
+    {
+        return [
+            'edit_name' => 'required|string|max:255',
+            'edit_key' => 'required|string',
+            'edit_priority' => 'required|integer|min:0',
+            'edit_rate_limit' => 'required|integer|min:1',
+        ];
+    }
+
     public function toggleStatus(int $idApi, string $newStatus): void
     {
         $apiKey = ApiKey::find($idApi);
 
-        // Mencegah perubahan status jika sedang dalam kondisi cooldown
         if ($apiKey && $apiKey->status !== 'cooldown') {
             $apiKey->update([
                 'status' => $newStatus,
                 'cooldown_until' => $newStatus === 'ready' ? null : $apiKey->cooldown_until,
             ]);
+            session()->flash('success', 'Status API Key berhasil diperbarui.');
         }
     }
 
     public function deleteKey(int $idApi): void
     {
         ApiKey::where('id_api', $idApi)->delete();
+        session()->flash('success', 'API Key berhasil dihapus.');
+    }
+
+    // --- FITUR EDIT API KEY ---
+    public function editKey(int $idApi): void
+    {
+        $key = ApiKey::find($idApi);
+        if ($key) {
+            $this->editingKeyId = $key->id_api;
+            $this->edit_name = $key->name;
+            // Mengambil plaintext dari Accessor Model
+            $this->edit_key = $key->decrypted_key;
+            $this->edit_priority = $key->priority;
+            $this->edit_rate_limit = $key->rate_limit ?? 60;
+        }
+    }
+
+    public function cancelEditKey(): void
+    {
+        $this->reset(['editingKeyId', 'edit_name', 'edit_key', 'edit_priority', 'edit_rate_limit']);
+    }
+
+    // --- UPDATE API KEY ---
+    public function updateKey(): void
+    {
+        $this->validate();
+
+        $apiKey = ApiKey::find($this->editingKeyId);
+        if ($apiKey) {
+            $oldPriority = $apiKey->priority;
+            $newPriority = (int) $this->edit_priority;
+
+            // Geser priority jika terjadi perubahan urutan
+            if ($oldPriority !== $newPriority) {
+                ApiKey::where('id_provider', $apiKey->id_provider)->where('id_api', '!=', $apiKey->id_api)->where('priority', '>=', $newPriority)->increment('priority');
+            }
+
+            $apiKey->update([
+                'name' => trim($this->edit_name),
+                'encrypted_key' => trim($this->edit_key), // Otomatis di-encrypt oleh Mutator Model
+                'priority' => $newPriority,
+                'rate_limit' => $this->edit_rate_limit,
+            ]);
+
+            session()->flash('success', 'API Key berhasil diperbarui!');
+            $this->cancelEditKey();
+        }
+    }
+
+    // --- TAMBAH API KEY BARU ---
+    public function storeKey(int $providerId): void
+    {
+        $this->validate([
+            'new_key_name' => 'required|string|max:255',
+            'new_key_string' => 'required|string',
+            'new_key_priority' => 'required|integer|min:0',
+            'new_key_rate_limit' => 'required|integer|min:1',
+        ]);
+
+        $targetPriority = (int) $this->new_key_priority;
+
+        // Geser priority yang ada jika memasukkan priority bentrok/lebih rendah
+        ApiKey::where('id_provider', $providerId)->where('priority', '>=', $targetPriority)->increment('priority');
+
+        ApiKey::create([
+            'id_provider' => $providerId,
+            'name' => trim($this->new_key_name),
+            'encrypted_key' => trim($this->new_key_string), // Otomatis di-encrypt oleh Mutator Model
+            'priority' => $targetPriority,
+            'rate_limit' => $this->new_key_rate_limit,
+            'status' => 'ready',
+        ]);
+
+        session()->flash('success', 'API Key baru berhasil ditambahkan.');
+        $this->reset(['new_key_name', 'new_key_string', 'new_key_priority', 'new_key_rate_limit']);
+    }
+
+    public function storeProvider(): void
+    {
+        $this->validate([
+            'new_provider_slug' => 'required|string|unique:ai_providers,slug',
+            'new_provider_default_model' => 'required|string',
+        ]);
+
+        AiProvider::create([
+            'slug' => strtolower(trim($this->new_provider_slug)),
+            'default_model' => trim($this->new_provider_default_model),
+        ]);
+
+        session()->flash('success', 'Provider AI berhasil ditambahkan.');
+        $this->reset(['new_provider_slug', 'new_provider_default_model']);
+    }
+
+    public function deleteProvider(int $providerId): void
+    {
+        AiProvider::destroy($providerId);
+        session()->flash('success', 'Provider beserta seluruh API Key di dalamnya berhasil dihapus.');
     }
 
     public function with(): array
     {
-        // Auto-reset API Key yang sudah melewati masa cooldown
+        // Auto-reset status cooldown yang telah lewat waktu
         ApiKey::where('status', 'cooldown')
             ->where('cooldown_until', '<=', Carbon::now())
             ->update([
@@ -45,7 +169,9 @@ new class extends Component {
 };
 ?>
 
-<div class="space-y-6">
+{{-- wire:poll.3s.keep memastikan polling tidak mengganggu input saat user fokus mengedit --}}
+<div wire:poll.3s.keep class="space-y-6">
+
     {{-- Alert Messages --}}
     @if (session()->has('success'))
         <div class="p-4 mb-4 text-sm text-green-300 rounded-lg bg-green-950/80 border border-green-700" role="alert">
@@ -68,8 +194,7 @@ new class extends Component {
                     ->paginate(5, ['*'], 'page_' . $provider->id_provider);
             @endphp
 
-            {{-- Card Accordion per Slug --}}
-            <div x-data="{ open: false, editing: false }" class="border border-gray-700 bg-gray-800 rounded-lg overflow-hidden shadow-sm">
+            <div x-data="{ open: true }" class="border border-gray-700 bg-gray-800 rounded-lg overflow-hidden shadow-sm">
 
                 {{-- Header Accordion --}}
                 <div
@@ -87,31 +212,17 @@ new class extends Component {
                         </span>
                     </div>
 
-                    {{-- Action Header --}}
                     <div class="flex items-center space-x-2">
-                        <button @click.stop="editing = !editing; if(editing) open = true;" type="button"
-                            class="text-xs px-2.5 py-1.5 bg-blue-700/80 hover:bg-blue-600 text-white rounded-md transition flex items-center space-x-1">
+                        <button wire:click="deleteProvider({{ $provider->id_provider }})"
+                            wire:confirm="Apakah Anda yakin ingin menghapus provider {{ strtoupper($provider->slug) }} beserta seluruh API Key di dalamnya?"
+                            type="button"
+                            class="text-xs px-2.5 py-1.5 bg-red-800/80 hover:bg-red-700 text-white rounded-md transition flex items-center space-x-1">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                    d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                                    d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                             </svg>
-                            <span x-text="editing ? 'Batal' : 'Edit'">Edit</span>
+                            <span>Hapus Provider</span>
                         </button>
-
-                        <form action="{{ route('providers.destroy', $provider->id_provider) }}" method="POST"
-                            onsubmit="return confirm('Apakah Anda yakin ingin menghapus provider {{ strtoupper($provider->slug) }} ini beserta seluruh API Key di dalamnya?');"
-                            class="inline">
-                            @csrf
-                            @method('DELETE')
-                            <button type="submit" @click.stop
-                                class="text-xs px-2.5 py-1.5 bg-red-800/80 hover:bg-red-700 text-white rounded-md transition flex items-center space-x-1">
-                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                                </svg>
-                                <span>Hapus</span>
-                            </button>
-                        </form>
 
                         <button @click="open = !open" type="button" class="focus:outline-none pl-1">
                             <svg class="w-5 h-5 text-gray-400 transform transition-transform duration-200"
@@ -124,49 +235,15 @@ new class extends Component {
                     </div>
                 </div>
 
-                {{-- Inline Form: Edit Provider --}}
-                <div x-show="editing" x-collapse x-cloak class="p-4 border-t border-b border-gray-700 bg-gray-900/70">
-                    <form action="{{ route('providers.update', $provider->id_provider) }}" method="POST"
-                        class="space-y-3">
-                        @csrf
-                        @method('PUT')
-                        <div class="text-xs font-semibold uppercase text-blue-400 tracking-wider mb-2">Edit Provider:
-                            {{ $provider->slug }}</div>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                            <div>
-                                <label class="block mb-1 text-xs font-medium text-gray-300">Slug Provider</label>
-                                <input type="text" name="slug" value="{{ old('slug', $provider->slug) }}" required
-                                    class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500">
-                            </div>
-                            <div>
-                                <label class="block mb-1 text-xs font-medium text-gray-300">Default Model</label>
-                                <input type="text" name="default_model"
-                                    value="{{ old('default_model', $provider->default_model) }}" required
-                                    class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500">
-                            </div>
-                        </div>
-                        <div class="flex justify-end space-x-2 pt-1">
-                            <button @click="editing = false" type="button"
-                                class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs rounded-lg transition">
-                                Batal
-                            </button>
-                            <button type="submit"
-                                class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition">
-                                Perbarui Provider
-                            </button>
-                        </div>
-                    </form>
-                </div>
-
                 {{-- Body Accordion --}}
-                <div x-show="open" x-collapse x-cloak class="border-t border-gray-700 bg-gray-900/50">
+                <div x-show="open" x-collapse class="border-t border-gray-700 bg-gray-900/50">
                     <div class="overflow-x-auto p-4">
                         <table class="w-full text-sm text-left text-gray-300">
                             <thead class="text-xs uppercase bg-gray-800 text-gray-400 border-b border-gray-700">
                                 <tr>
                                     <th scope="col" class="px-4 py-3">No</th>
                                     <th scope="col" class="px-4 py-3">Name</th>
-                                    <th scope="col" class="px-4 py-3">Key (Encrypted)</th>
+                                    <th scope="col" class="px-4 py-3">Key (Preview)</th>
                                     <th scope="col" class="px-4 py-3">Status</th>
                                     <th scope="col" class="px-4 py-3">Priority</th>
                                     <th scope="col" class="px-4 py-3">Req / Err</th>
@@ -182,24 +259,23 @@ new class extends Component {
                                         </td>
                                         <td class="px-4 py-3 font-semibold text-white">{{ $key->name }}</td>
                                         <td class="px-4 py-3 font-mono text-xs text-gray-400">
-                                            {{ Str::limit($key->encrypted_key, 20, '...') }}
+                                            {{-- Menampilkan 6 karakter pertama dari decrypted key agar aman --}}
+                                            {{ Str::limit($key->decrypted_key, 12, '***') }}
                                         </td>
 
-                                        {{-- KOLOM STATUS --}}
+                                        {{-- STATUS --}}
                                         <td class="px-4 py-3">
                                             @if ($key->status === 'ready')
                                                 <button wire:click="toggleStatus({{ $key->id_api }}, 'disabled')"
                                                     type="button"
-                                                    class="px-2.5 py-1 text-xs font-semibold rounded-md bg-green-900/50 hover:bg-green-800/80 text-green-400 border border-green-700 transition flex items-center space-x-1 group"
-                                                    title="Klik untuk menonaktifkan API Key">
+                                                    class="px-2.5 py-1 text-xs font-semibold rounded-md bg-green-900/50 hover:bg-green-800/80 text-green-400 border border-green-700 transition flex items-center space-x-1 group">
                                                     <span class="w-2 h-2 rounded-full bg-green-400"></span>
                                                     <span>Ready</span>
                                                 </button>
                                             @elseif($key->status === 'cooldown')
                                                 <div class="flex flex-col space-y-0.5">
                                                     <button type="button" disabled
-                                                        class="px-2.5 py-1 text-xs font-semibold rounded-md bg-yellow-900/40 text-yellow-400 border border-yellow-700/80 cursor-not-allowed opacity-80 flex items-center space-x-1"
-                                                        title="Cooldown s/d {{ $key->cooldown_until ? $key->cooldown_until->format('H:i:s d/m/Y') : '-' }}">
+                                                        class="px-2.5 py-1 text-xs font-semibold rounded-md bg-yellow-900/40 text-yellow-400 border border-yellow-700/80 cursor-not-allowed opacity-80 flex items-center space-x-1">
                                                         <span
                                                             class="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></span>
                                                         <span>Cooldown</span>
@@ -207,15 +283,13 @@ new class extends Component {
                                                     @if ($key->cooldown_until)
                                                         <span class="text-[10px] text-yellow-400/80 font-mono">
                                                             s/d {{ $key->cooldown_until->format('H:i:s') }}
-                                                            ({{ $key->cooldown_until->diffForHumans() }})
                                                         </span>
                                                     @endif
                                                 </div>
                                             @else
                                                 <button wire:click="toggleStatus({{ $key->id_api }}, 'ready')"
                                                     type="button"
-                                                    class="px-2.5 py-1 text-xs font-semibold rounded-md bg-red-900/50 hover:bg-red-800/80 text-red-400 border border-red-700 transition flex items-center space-x-1 group"
-                                                    title="Klik untuk mengaktifkan API Key">
+                                                    class="px-2.5 py-1 text-xs font-semibold rounded-md bg-red-900/50 hover:bg-red-800/80 text-red-400 border border-red-700 transition flex items-center space-x-1 group">
                                                     <span class="w-2 h-2 rounded-full bg-red-400"></span>
                                                     <span>Disabled</span>
                                                 </button>
@@ -231,8 +305,12 @@ new class extends Component {
                                             {{ $key->last_used_at ? $key->last_used_at->diffForHumans() : '-' }}
                                         </td>
 
-                                        {{-- KOLOM AKSI --}}
-                                        <td class="px-4 py-3 text-right">
+                                        {{-- AKSI --}}
+                                        <td class="px-4 py-3 text-right space-x-1">
+                                            <button wire:click="editKey({{ $key->id_api }})" type="button"
+                                                class="text-xs px-2.5 py-1 bg-blue-700/80 hover:bg-blue-600 text-white rounded transition">
+                                                Edit
+                                            </button>
                                             <button wire:click="deleteKey({{ $key->id_api }})" type="button"
                                                 wire:confirm="Yakin ingin menghapus API key ini?"
                                                 class="text-xs px-2.5 py-1 bg-red-800/80 hover:bg-red-700 text-white rounded transition">
@@ -243,7 +321,7 @@ new class extends Component {
                                 @empty
                                     <tr>
                                         <td colspan="8" class="px-4 py-6 text-center text-gray-500">
-                                            Belum ada API Key untuk provider ini. Buka form di bawah untuk menambahkan.
+                                            Belum ada API Key untuk provider ini.
                                         </td>
                                     </tr>
                                 @endforelse
@@ -279,41 +357,38 @@ new class extends Component {
                             </summary>
 
                             <div class="p-4 border-t border-gray-700 bg-gray-900/60">
-                                <form action="{{ route('api-keys.store', $provider->id_provider) }}" method="POST"
-                                    class="space-y-3">
-                                    @csrf
+                                <form wire:submit.prevent="storeKey({{ $provider->id_provider }})" class="space-y-3">
                                     <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
                                         <div>
                                             <label class="block mb-1 text-xs font-medium text-gray-300">Nama
                                                 Key</label>
-                                            <input type="text" name="name"
-                                                placeholder="mis. Key Utama / Production" required
-                                                class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-emerald-500 focus:border-emerald-500">
+                                            <input type="text" wire:model="new_key_name"
+                                                placeholder="mis. Key Utama" required
+                                                class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-emerald-500">
                                         </div>
 
                                         <div>
                                             <label class="block mb-1 text-xs font-medium text-gray-300">API Key
                                                 String</label>
-                                            <input type="text" name="encrypted_key" placeholder="AIzaSy..."
-                                                autocomplete="off" autocorrect="off" autocapitalize="off"
-                                                spellcheck="false" required
-                                                class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-emerald-500 focus:border-emerald-500 font-mono">
+                                            <input type="text" wire:model="new_key_string" placeholder="AIzaSy..."
+                                                required
+                                                class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-emerald-500 font-mono">
                                         </div>
 
                                         <div>
                                             <label
                                                 class="block mb-1 text-xs font-medium text-gray-300">Priority</label>
-                                            <input type="number" name="priority" min="0" value="1"
+                                            <input type="number" wire:model="new_key_priority" min="0"
                                                 required
-                                                class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-emerald-500 focus:border-emerald-500">
+                                                class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-emerald-500">
                                         </div>
 
                                         <div>
                                             <label class="block mb-1 text-xs font-medium text-gray-300">Rate Limit
                                                 (Req/Min)</label>
-                                            <input type="number" name="rate_limit" min="1" value="60"
+                                            <input type="number" wire:model="new_key_rate_limit" min="1"
                                                 required
-                                                class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-emerald-500 focus:border-emerald-500">
+                                                class="w-full px-3 py-1.5 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-emerald-500">
                                         </div>
                                     </div>
 
@@ -336,6 +411,73 @@ new class extends Component {
         @endforelse
     </div>
 
+    {{-- MODAL UPDATE API KEY (TAMPILKAN DECRYPTED KEY DAN SIMPAN ENCRYPTED) --}}
+    @if ($editingKeyId)
+        <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+            <div class="bg-gray-800 border border-gray-700 rounded-lg p-6 w-full max-w-lg shadow-xl space-y-4">
+                <div class="flex justify-between items-center border-b border-gray-700 pb-3">
+                    <h3 class="text-lg font-semibold text-white">Edit API Key</h3>
+                    <button wire:click="cancelEditKey" class="text-gray-400 hover:text-white">&times;</button>
+                </div>
+
+                <form wire:submit.prevent="updateKey" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-medium text-gray-300 mb-1">Nama Key</label>
+                        <input type="text" wire:model="edit_name" required
+                            class="w-full px-3 py-2 bg-gray-900 border border-gray-600 rounded-lg text-white text-sm">
+                        @error('edit_name')
+                            <span class="text-xs text-red-400">{{ $message }}</span>
+                        @enderror
+                    </div>
+
+                    <div>
+                        <label class="block text-xs font-medium text-gray-300 mb-1">
+                            API Key Value <span class="text-emerald-400 text-[10px]">(Sudah di-decrypt)</span>
+                        </label>
+                        <input type="text" wire:model="edit_key" required
+                            class="w-full px-3 py-2 bg-gray-900 border border-gray-600 rounded-lg text-white font-mono text-sm focus:ring-emerald-500">
+                        <p class="text-[10px] text-gray-400 mt-1">Mengedit nilai ini akan otomatis meng-encrypt ulang
+                            sebelum disimpan ke database.</p>
+                        @error('edit_key')
+                            <span class="text-xs text-red-400">{{ $message }}</span>
+                        @enderror
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-300 mb-1">Priority</label>
+                            <input type="number" wire:model="edit_priority" min="0" required
+                                class="w-full px-3 py-2 bg-gray-900 border border-gray-600 rounded-lg text-white text-sm">
+                            @error('edit_priority')
+                                <span class="text-xs text-red-400">{{ $message }}</span>
+                            @enderror
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-medium text-gray-300 mb-1">Rate Limit (Req/Min)</label>
+                            <input type="number" wire:model="edit_rate_limit" min="1" required
+                                class="w-full px-3 py-2 bg-gray-900 border border-gray-600 rounded-lg text-white text-sm">
+                            @error('edit_rate_limit')
+                                <span class="text-xs text-red-400">{{ $message }}</span>
+                            @enderror
+                        </div>
+                    </div>
+
+                    <div class="flex justify-end space-x-2 pt-2">
+                        <button type="button" wire:click="cancelEditKey"
+                            class="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs rounded-lg">
+                            Batal
+                        </button>
+                        <button type="submit"
+                            class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg">
+                            Simpan Perubahan
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    @endif
+
     {{-- 2. Form Tambah Provider --}}
     <details class="group bg-gray-800 border border-gray-700 rounded-lg shadow-sm overflow-hidden">
         <summary
@@ -353,28 +495,24 @@ new class extends Component {
         </summary>
 
         <div class="p-5 border-t border-gray-700 bg-gray-900/40">
-            <form action="{{ route('providers.store') }}" method="POST" class="space-y-4">
-                @csrf
+            <form wire:submit.prevent="storeProvider" class="space-y-4">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
-                        <label for="slug" class="block mb-1 text-sm font-medium text-gray-300">Slug
-                            Provider</label>
-                        <input type="text" id="slug" name="slug" value="{{ old('slug') }}"
-                            placeholder="Contoh: gemini, openai" required
-                            class="w-full px-3.5 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 @error('slug') border-red-500 @enderror">
-                        @error('slug')
+                        <label class="block mb-1 text-sm font-medium text-gray-300">Slug Provider</label>
+                        <input type="text" wire:model="new_provider_slug" placeholder="Contoh: gemini, openai"
+                            required
+                            class="w-full px-3.5 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500">
+                        @error('new_provider_slug')
                             <p class="mt-1 text-xs text-red-400">{{ $message }}</p>
                         @enderror
                     </div>
 
                     <div>
-                        <label for="default_model" class="block mb-1 text-sm font-medium text-gray-300">Default
-                            Model</label>
-                        <input type="text" id="default_model" name="default_model"
-                            value="{{ old('default_model') }}" placeholder="Contoh: gemini-1.5-flash, gemini-1.5-pro"
-                            required
-                            class="w-full px-3.5 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 @error('default_model') border-red-500 @enderror">
-                        @error('default_model')
+                        <label class="block mb-1 text-sm font-medium text-gray-300">Default Model</label>
+                        <input type="text" wire:model="new_provider_default_model"
+                            placeholder="Contoh: gemini-1.5-flash" required
+                            class="w-full px-3.5 py-2 bg-gray-800 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500">
+                        @error('new_provider_default_model')
                             <p class="mt-1 text-xs text-red-400">{{ $message }}</p>
                         @enderror
                     </div>
