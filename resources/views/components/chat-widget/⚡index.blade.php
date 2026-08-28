@@ -67,10 +67,30 @@ new class extends Component {
                     <div :class="msg.role === 'user' ?
                         'bg-blue-600 text-white rounded-br-none' :
                         'bg-gray-800 text-gray-200 border border-gray-700/70 rounded-bl-none'"
-                        class="inline-block px-3.5 py-2.5 rounded-xl max-w-[85%] text-left whitespace-pre-line leading-relaxed shadow-sm">
-                        <span x-text="msg.content"></span>
-                        <span x-show="isStreaming && i === messages.length - 1"
-                            class="inline-block w-1.5 h-3 bg-blue-400 animate-pulse ml-0.5"></span>
+                        class="inline-block px-3.5 py-2.5 rounded-xl max-w-[85%] text-left leading-relaxed shadow-sm break-words">
+
+                        {{-- Tampilan saat AI sedang diproses (Content masih kosong & sedang streaming) --}}
+                        <template
+                            x-if="msg.role === 'assistant' && !msg.content && isStreaming && i === messages.length - 1">
+                            <div class="flex items-center space-x-2 text-gray-400 font-medium py-0.5">
+                                <div class="flex space-x-1">
+                                    <span class="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce"
+                                        style="animation-delay: 0ms"></span>
+                                    <span class="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce"
+                                        style="animation-delay: 150ms"></span>
+                                    <span class="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce"
+                                        style="animation-delay: 300ms"></span>
+                                </div>
+                                <span class="text-[11px] text-gray-400 italic">Sabar guys ini lagi loading...</span>
+                            </div>
+                        </template>
+
+                        {{-- Tampilan Teks Normal / Markdown --}}
+                        <span x-show="msg.content" x-html="parseMarkdown(msg.content)"></span>
+
+                        {{-- Kursor kedip saat teks sedang ber-stream --}}
+                        <span x-show="isStreaming && msg.content && i === messages.length - 1"
+                            class="inline-block w-1.5 h-3 bg-blue-400 animate-pulse ml-0.5 align-middle"></span>
                     </div>
 
                 </div>
@@ -173,178 +193,204 @@ new class extends Component {
                     }
                 },
 
-                buildVocabulary() {
-                    const vocabSet = new Set();
-                    this.knowledgeBase.forEach(item => {
-                        this.normalizeText(item.title).split(/\s+/).forEach(w => {
+                // Parser Markdown Ringan & Aman (Escape XSS + Bold, Italic, Code, List, Newline)
+                parseMarkdown(text) {
+                    if (!text) return '';
+
+                    let html = text
+                        .replace(/&/g, "&amp;")
+                        .replace(/</g, "&lt;")
+                        .replace(/>/g, "&gt;");
+
+                    html = html.replace(/```([\s\S]*?)```/g,
+                        '<pre class="bg-gray-950 p-2 rounded border border-gray-700 my-1 overflow-x-auto font-mono text-xs"><code>$1</code></pre>'
+                    );
+
+                    html = html.replace(/`([^`]+)`/g,
+                    '<code class="bg-gray-950 px-1 rounded text-blue-300 font-mono">$1</code>');
+
+                html = html.replace(/(\*\*\*|___)(.*?)\1/g, '<strong><em>$2</em></strong>');
+                html = html.replace(/(\*\*|__)(.*?)\1/g, '<strong class="font-bold text-white">$2</strong>');
+                html = html.replace(/(\*|_)(.*?)\1/g, '<em class="italic">$2</em>');
+                html = html.replace(/^\s*[\*\-]\s+(.*)$/gm, '<li class="ml-4 list-disc">$1</li>');
+                html = html.replace(/\n/g, '<br>');
+
+                return html;
+            },
+
+            buildVocabulary() {
+                const vocabSet = new Set();
+                this.knowledgeBase.forEach(item => {
+                    this.normalizeText(item.title).split(/\s+/).forEach(w => {
+                        if (w.length > 2 && !this.stopwords.has(w)) vocabSet.add(w);
+                    });
+                    item.keywords.forEach(kw => {
+                        this.normalizeText(kw).split(/\s+/).forEach(w => {
                             if (w.length > 2 && !this.stopwords.has(w)) vocabSet.add(w);
                         });
-                        item.keywords.forEach(kw => {
-                            this.normalizeText(kw).split(/\s+/).forEach(w => {
-                                if (w.length > 2 && !this.stopwords.has(w)) vocabSet.add(w);
-                            });
+                    });
+                });
+
+                this.vocabulary = Array.from(vocabSet).map(word => ({
+                    word
+                }));
+                this.fuseVocab = new Fuse(this.vocabulary, {
+                    keys: ['word'],
+                    includeScore: true,
+                    threshold: 0.4,
+                    distance: 100,
+                    minMatchCharLength: 3
+                });
+            },
+
+            normalizeText(text) {
+                return String(text || '')
+                    .toLowerCase()
+                    .normalize('NFKC')
+                    .replace(/[^a-z0-9\s]/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+            },
+
+            tokenizeQueryWithTypoCorrection(rawQuery) {
+                const normalized = this.normalizeText(rawQuery);
+                const rawTokens = normalized.split(/\s+/).filter(Boolean).filter(w => !this.stopwords.has(w));
+                const correctedTokens = [];
+
+                rawTokens.forEach(token => {
+                    const isExact = this.vocabulary.some(v => v.word === token);
+                    if (isExact || token.length <= 2) {
+                        correctedTokens.push({
+                            original: token,
+                            corrected: token,
+                            isTypo: false
                         });
-                    });
-
-                    this.vocabulary = Array.from(vocabSet).map(word => ({
-                        word
-                    }));
-                    this.fuseVocab = new Fuse(this.vocabulary, {
-                        keys: ['word'],
-                        includeScore: true,
-                        threshold: 0.4,
-                        distance: 100,
-                        minMatchCharLength: 3
-                    });
-                },
-
-                normalizeText(text) {
-                    return String(text || '')
-                        .toLowerCase()
-                        .normalize('NFKC')
-                        .replace(/[^a-z0-9\s]/g, ' ')
-                        .replace(/\s+/g, ' ')
-                        .trim();
-                },
-
-                tokenizeQueryWithTypoCorrection(rawQuery) {
-                    const normalized = this.normalizeText(rawQuery);
-                    const rawTokens = normalized.split(/\s+/).filter(Boolean).filter(w => !this.stopwords.has(w));
-                    const correctedTokens = [];
-
-                    rawTokens.forEach(token => {
-                        const isExact = this.vocabulary.some(v => v.word === token);
-                        if (isExact || token.length <= 2) {
+                    } else if (this.fuseVocab) {
+                        const res = this.fuseVocab.search(token);
+                        if (res.length > 0 && res[0].score <= 0.38) {
+                            correctedTokens.push({
+                                original: token,
+                                corrected: res[0].item.word,
+                                isTypo: true
+                            });
+                        } else {
                             correctedTokens.push({
                                 original: token,
                                 corrected: token,
                                 isTypo: false
                             });
-                        } else if (this.fuseVocab) {
-                            const res = this.fuseVocab.search(token);
-                            if (res.length > 0 && res[0].score <= 0.38) {
-                                correctedTokens.push({
-                                    original: token,
-                                    corrected: res[0].item.word,
-                                    isTypo: true
-                                });
-                            } else {
-                                correctedTokens.push({
-                                    original: token,
-                                    corrected: token,
-                                    isTypo: false
-                                });
-                            }
                         }
-                    });
+                    }
+                });
 
-                    return correctedTokens;
-                },
+                return correctedTokens;
+            },
 
-                calculateScore(queryTokens, item) {
-                    let score = 0;
-                    let reasons = [];
-                    const itemTitle = this.normalizeText(item.title);
-                    const itemContent = this.normalizeText(item.content);
-                    const itemKeywords = item.keywords.map(k => this.normalizeText(k));
+            calculateScore(queryTokens, item) {
+                let score = 0;
+                let reasons = [];
+                const itemTitle = this.normalizeText(item.title);
+                const itemContent = this.normalizeText(item.content);
+                const itemKeywords = item.keywords.map(k => this.normalizeText(k));
 
-                    queryTokens.forEach(t => {
-                        const word = t.corrected;
-                        const baseWeight = t.isTypo ? 0.75 : 1.0;
+                queryTokens.forEach(t => {
+                    const word = t.corrected;
+                    const baseWeight = t.isTypo ? 0.75 : 1.0;
 
-                        for (const kw of itemKeywords) {
-                            if (kw === word) {
-                                score += Math.round(100 * baseWeight);
-                                break;
-                            } else if (kw.includes(word)) {
-                                score += Math.round(60 * baseWeight);
-                                break;
-                            }
+                    for (const kw of itemKeywords) {
+                        if (kw === word) {
+                            score += Math.round(100 * baseWeight);
+                            break;
+                        } else if (kw.includes(word)) {
+                            score += Math.round(60 * baseWeight);
+                            break;
                         }
-
-                        if (itemTitle.includes(word)) score += Math.round(40 * baseWeight);
-                        if (itemContent.includes(word)) score += Math.round(15 * baseWeight);
-                    });
-
-                    return {
-                        score,
-                        reasons
-                    };
-                },
-
-                getTop5Knowledge(rawQuery) {
-                    if (!this.knowledgeBase.length || !rawQuery || !rawQuery.trim()) return [];
-
-                    const queryTokens = this.tokenizeQueryWithTypoCorrection(rawQuery);
-                    const scoredItems = [];
-
-                    for (const item of this.knowledgeBase) {
-                        const {
-                            score,
-                            reasons
-                        } = this.calculateScore(queryTokens, item);
-                        scoredItems.push({
-                            item,
-                            score,
-                            reasons
-                        });
                     }
 
-                    const relevant = scoredItems.filter(entry => entry.score >= this.MIN_RELEVANCE_SCORE);
-                    relevant.sort((a, b) => b.score - a.score);
+                    if (itemTitle.includes(word)) score += Math.round(40 * baseWeight);
+                    if (itemContent.includes(word)) score += Math.round(15 * baseWeight);
+                });
 
-                    return relevant.slice(0, 5).map(entry => ({
-                        id: entry.item.id,
-                        title: entry.item.title,
-                        content: entry.item.content
-                    }));
-                },
+                return {
+                    score,
+                    reasons
+                };
+            },
 
-                scrollToBottom() {
-                    this.$nextTick(() => {
-                        if (this.$refs.chatContainer) {
-                            this.$refs.chatContainer.scrollTop = this.$refs.chatContainer.scrollHeight;
-                        }
+            getTop5Knowledge(rawQuery) {
+                if (!this.knowledgeBase.length || !rawQuery || !rawQuery.trim()) return [];
+
+                const queryTokens = this.tokenizeQueryWithTypoCorrection(rawQuery);
+                const scoredItems = [];
+
+                for (const item of this.knowledgeBase) {
+                    const {
+                        score,
+                        reasons
+                    } = this.calculateScore(queryTokens, item);
+                    scoredItems.push({
+                        item,
+                        score,
+                        reasons
                     });
-                },
+                }
 
-                async handleSend() {
-                    if (!this.userPrompt.trim() || this.isStreaming) return;
+                const relevant = scoredItems.filter(entry => entry.score >= this.MIN_RELEVANCE_SCORE);
+                relevant.sort((a, b) => b.score - a.score);
 
-                    const promptText = this.userPrompt;
-                    this.userPrompt = '';
+                return relevant.slice(0, 5).map(entry => ({
+                    id: entry.item.id,
+                    title: entry.item.title,
+                    content: entry.item.content
+                }));
+            },
 
-                    this.messages.push({
-                        role: 'user',
-                        content: promptText
+            scrollToBottom() {
+                this.$nextTick(() => {
+                    if (this.$refs.chatContainer) {
+                        this.$refs.chatContainer.scrollTop = this.$refs.chatContainer.scrollHeight;
+                    }
+                });
+            },
+
+            async handleSend() {
+                if (!this.userPrompt.trim() || this.isStreaming) return;
+
+                const promptText = this.userPrompt;
+                this.userPrompt = '';
+
+                this.messages.push({
+                    role: 'user',
+                    content: promptText
+                });
+                const top5Knowledge = this.getTop5Knowledge(promptText);
+
+                this.messages.push({
+                    role: 'assistant',
+                    content: ''
+                });
+                const assistantIndex = this.messages.length - 1;
+                this.isStreaming = true;
+                this.scrollToBottom();
+
+                try {
+                    const response = await fetch('/api/chat/stream', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.getAttribute(
+                                'content') || ''
+                        },
+                        body: JSON.stringify({
+                            knowledge: top5Knowledge,
+                            query: promptText
+                        })
                     });
-                    const top5Knowledge = this.getTop5Knowledge(promptText);
 
-                    this.messages.push({
-                        role: 'assistant',
-                        content: ''
-                    });
-                    const assistantIndex = this.messages.length - 1;
-                    this.isStreaming = true;
-                    this.scrollToBottom();
-
-                    try {
-                        const response = await fetch('/api/chat/stream', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.getAttribute(
-                                    'content') || ''
-                            },
-                            body: JSON.stringify({
-                                knowledge: top5Knowledge,
-                                query: promptText
-                            })
-                        });
-
-                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
                         const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+                        let sseBuffer = '';
 
                         while (true) {
                             const {
@@ -354,7 +400,10 @@ new class extends Component {
                             if (done) break;
 
                             if (value) {
-                                const lines = value.split('\n');
+                                sseBuffer += value;
+                                const lines = sseBuffer.split('\n');
+                                sseBuffer = lines.pop();
+
                                 for (let line of lines) {
                                     line = line.trim();
                                     if (line.startsWith('data: ')) {
@@ -362,8 +411,6 @@ new class extends Component {
                                         if (content === '[DONE]') break;
                                         try {
                                             const json = JSON.parse(content);
-
-                                            // Extraksi khusus struktur JSON SSE Gemini AI Studio
                                             const textChunk = json.candidates?.[0]?.content?.parts?.[0]?.text ||
                                                 json.choices?.[0]?.delta?.content ||
                                                 json.text ||
@@ -371,7 +418,7 @@ new class extends Component {
 
                                             this.messages[assistantIndex].content += textChunk;
                                         } catch (e) {
-                                            // Abaikan pemindaian jika chunk terpotong
+                                            // Abaikan jika chunk JSON terpotong di tengah stream
                                         }
                                     } else if (line && !line.startsWith(':') && !line.startsWith('data:')) {
                                         this.messages[assistantIndex].content += line;

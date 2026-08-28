@@ -8,15 +8,15 @@ use Illuminate\Support\Facades\Http;
 use App\Services\ApiKeyManagerService;
 
 // Endpoints Knowledge Base
-Route::get('/knowledge/version', [KnowledgeController::class, 'version']);
-Route::get('/knowledge/download', [KnowledgeController::class, 'download']);
+Route::get('/knowledge/version', [KnowledgeController::class, 'version'])->name('knowledge.version');
+Route::get('/knowledge/download', [KnowledgeController::class, 'download'])->name('knowledge.download');
 
 // Endpoint Streaming AI Gateway dengan Proteksi Security
 Route::middleware([AntiAbuseMiddleware::class])->group(function () {
     Route::post('/chat/stream', [ChatGatewayController::class, 'stream'])->name('chat.stream');
 });
 
-
+// Route Debugging Gemini API
 Route::get('/debug-gemini', function (ApiKeyManagerService $keyManager) {
     $apiKeyModel = $keyManager->getAvailableKey('gemini');
 
@@ -25,8 +25,6 @@ Route::get('/debug-gemini', function (ApiKeyManagerService $keyManager) {
     }
 
     $rawKey = trim($keyManager->decryptKey($apiKeyModel));
-
-    // Cek format prefix key resmi Google AI Studio
     $isGoogleFormat = str_starts_with($rawKey, 'AIza');
 
     $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=" . $rawKey;

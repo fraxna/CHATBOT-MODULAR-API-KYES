@@ -4,7 +4,6 @@ namespace App\Http\Controllers;
 
 use App\Services\ApiKeyManagerService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
@@ -32,7 +31,7 @@ class ChatGatewayController extends Controller
 
         if ($availableKeyModels->isEmpty()) {
             return response()->stream(function () {
-                echo "data: " . json_encode(['text' => 'Maaf, layanan AI sedang tidak tersedia saat ini.']) . "\n\n";
+                echo "data: " . json_encode(['candidates' => [['content' => ['parts' => [['text' => 'Maaf, layanan AI sedang tidak tersedia saat ini.']]]]]]) . "\n\n";
                 echo "data: [DONE]\n\n";
                 if (ob_get_level() > 0)
                     ob_flush();
@@ -65,6 +64,14 @@ class ChatGatewayController extends Controller
 
         return response()->stream(function () use ($availableKeyModels, $prompt, $candidateModels) {
 
+            // Mematikan implicit output buffering bawaan PHP agar stream langsung terkirim
+            if (function_exists('apache_setenv')) {
+                @apache_setenv('no-gzip', '1');
+            }
+            @ini_set('zlib.output_compression', 'Off');
+            @ini_set('implicit_flush', '1');
+            ob_implicit_flush(true);
+
             $success = false;
             $lastHttpCode = 0;
             $lastErrorMessage = '';
@@ -76,74 +83,95 @@ class ChatGatewayController extends Controller
 
                 // Inner Loop: Iterasi fallback model untuk API Key saat ini
                 foreach ($candidateModels as $model) {
+                    // URL murni tanpa karakter markdown
                     $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:streamGenerateContent?alt=sse&key={$rawKey}";
 
-                    try {
-                        $response = Http::withoutVerifying()
-                            ->connectTimeout(10)
-                            ->timeout(45)
-                            ->withHeaders([
-                                'Content-Type' => 'application/json',
-                            ])
-                            ->post($url, [
-                                'contents' => [
-                                    [
-                                        'parts' => [
-                                            ['text' => $prompt]
-                                        ]
-                                    ]
+                    $payload = json_encode([
+                        'contents' => [
+                            [
+                                'parts' => [
+                                    ['text' => $prompt]
                                 ]
-                            ]);
+                            ]
+                        ]
+                    ]);
 
-                        if ($response->successful()) {
-                            $this->keyManager->recordSuccess($apiKeyModel);
-                            echo $response->body();
-                            $success = true;
-                            break 2; // Berhasil! Keluar dari kedua loop (Key & Model)
+                    $ch = curl_init();
+                    curl_setopt($ch, CURLOPT_URL, $url);
+                    curl_setopt($ch, CURLOPT_POST, true);
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                        'Content-Type: application/json',
+                    ]);
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+                    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                    curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+
+                    $httpCode = 200;
+                    $streamBuffer = '';
+
+                    curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $chunk) use (&$streamBuffer, &$httpCode) {
+                        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        if ($httpCode >= 200 && $httpCode < 300) {
+                            echo $chunk;
+                            if (ob_get_level() > 0)
+                                ob_flush();
+                            flush();
                         } else {
-                            $lastHttpCode = $response->status();
-                            $lastErrorMessage = $response->body();
-
-                            Log::warning("Gemini Model Error", [
-                                'key_id' => $apiKeyModel->id_api,
-                                'model' => $model,
-                                'status' => $lastHttpCode,
-                                'response' => $lastErrorMessage
-                            ]);
-
-                            // Jika error berupa Auth / Bad Request Key (400, 401, 403), tandai kunci rusak
-                            if (in_array($lastHttpCode, [400, 401, 403], true)) {
-                                $keyInvalid = true;
-                                break; // Out dari loop model, lanjut ke API Key berikutnya
-                            }
+                            $streamBuffer .= $chunk;
                         }
-                    } catch (\Throwable $e) {
-                        $lastHttpCode = 0;
-                        $lastErrorMessage = $e->getMessage();
-                        Log::error("Gemini Connection Error", [
+                        return strlen($chunk);
+                    });
+
+                    curl_exec($ch);
+                    $lastHttpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $curlError = curl_error($ch);
+                    curl_close($ch);
+
+                    if ($lastHttpCode >= 200 && $lastHttpCode < 300) {
+                        $this->keyManager->recordSuccess($apiKeyModel);
+                        $success = true;
+                        break 2; // Berhasil! Keluar dari loop key & model
+                    } else {
+                        $lastErrorMessage = $streamBuffer ?: $curlError;
+
+                        Log::warning("Gemini Model Error", [
                             'key_id' => $apiKeyModel->id_api,
                             'model' => $model,
-                            'error' => $lastErrorMessage
+                            'status' => $lastHttpCode,
+                            'response' => $lastErrorMessage
                         ]);
+
+                        if (in_array($lastHttpCode, [400, 401, 403], true)) {
+                            $keyInvalid = true;
+                            break;
+                        }
                     }
                 }
 
-                // Terapkan penanganan kegagalan untuk API Key saat ini
                 $this->keyManager->handleKeyFailure($apiKeyModel, $lastHttpCode, $lastErrorMessage);
 
-                // Jika key teridentifikasi invalid/disabled, pindah ke iteration key berikutnya
                 if ($keyInvalid) {
                     continue;
                 }
             }
 
-            // Jika seluruh API Key dan Model gagal diakses
             if (!$success) {
                 $pesanError = ($lastHttpCode === 0)
                     ? "Gagal terhubung ke Google AI (Timeout/Network Error: {$lastErrorMessage})."
                     : "Server AI menolak permintaan (HTTP {$lastHttpCode}).";
 
-                echo "data: " . json_encode(['text' => "\n[{$pesanError}]"]) . "\n\n";
+                echo "data: " . json_encode([
+                    'candidates' => [
+                        [
+                            'content' => [
+                                'parts' => [
+                                    ['text' => "\n[{$pesanError}]"]
+                                ]
+                            ]
+                        ]
+                    ]
+                ]) . "\n\n";
             }
 
             echo "data: [DONE]\n\n";
