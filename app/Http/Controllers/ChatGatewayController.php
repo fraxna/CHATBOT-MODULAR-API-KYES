@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Services\ApiKeyManagerService;
+use App\Services\RoleplayService; // 1. Import RoleplayService
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -10,10 +11,13 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 class ChatGatewayController extends Controller
 {
     protected ApiKeyManagerService $keyManager;
+    protected RoleplayService $roleplayService; // 2. Tambahkan properti
 
-    public function __construct(ApiKeyManagerService $keyManager)
+    // 3. Inject RoleplayService via Constructor
+    public function __construct(ApiKeyManagerService $keyManager, RoleplayService $roleplayService)
     {
         $this->keyManager = $keyManager;
+        $this->roleplayService = $roleplayService;
     }
 
     public function stream(Request $request): StreamedResponse
@@ -26,7 +30,10 @@ class ChatGatewayController extends Controller
         $query = $request->input('query');
         $knowledge = $request->input('knowledge', []);
 
-        // 1. Ambil SEMUA API Key Gemini yang statusnya ready/cooldown
+        // 4. Ambil prompt roleplay aktif
+        $systemRoleplay = $this->roleplayService->getRoleplay();
+
+        // Ambil SEMUA API Key Gemini yang statusnya ready/cooldown
         $availableKeyModels = $this->keyManager->getAvailableKeys('gemini');
 
         if ($availableKeyModels->isEmpty()) {
@@ -43,7 +50,7 @@ class ChatGatewayController extends Controller
             ]);
         }
 
-        // 2. Format Context Knowledge Base
+        // Format Context Knowledge Base
         $contextText = "";
         if (!empty($knowledge)) {
             $contextText = "Gunakan referensi informasi berikut untuk menjawab:\n";
@@ -54,7 +61,7 @@ class ChatGatewayController extends Controller
 
         $prompt = $contextText . "\nPertanyaan User: " . $query;
 
-        // 3. Candidate Models dengan Gemini 3.6 Flash sebagai Prioritas Utama
+        // Candidate Models dengan Gemini 3.6 Flash sebagai Prioritas Utama
         $candidateModels = [
             'gemini-3.6-flash',
             'gemini-2.0-flash',
@@ -62,9 +69,8 @@ class ChatGatewayController extends Controller
             'gemini-1.5-flash-lite'
         ];
 
-        return response()->stream(function () use ($availableKeyModels, $prompt, $candidateModels) {
+        return response()->stream(function () use ($availableKeyModels, $prompt, $candidateModels, $systemRoleplay) {
 
-            // Mematikan implicit output buffering bawaan PHP agar stream langsung terkirim
             if (function_exists('apache_setenv')) {
                 @apache_setenv('no-gzip', '1');
             }
@@ -76,17 +82,15 @@ class ChatGatewayController extends Controller
             $lastHttpCode = 0;
             $lastErrorMessage = '';
 
-            // Outer Loop: Iterasi semua API Key yang tersedia
             foreach ($availableKeyModels as $apiKeyModel) {
                 $rawKey = trim($this->keyManager->decryptKey($apiKeyModel));
                 $keyInvalid = false;
 
-                // Inner Loop: Iterasi fallback model untuk API Key saat ini
                 foreach ($candidateModels as $model) {
-                    // URL murni tanpa karakter markdown
                     $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:streamGenerateContent?alt=sse&key={$rawKey}";
 
-                    $payload = json_encode([
+                    // 5. Susun Payload dengan system_instruction
+                    $payloadData = [
                         'contents' => [
                             [
                                 'parts' => [
@@ -94,7 +98,18 @@ class ChatGatewayController extends Controller
                                 ]
                             ]
                         ]
-                    ]);
+                    ];
+
+                    // Sisipkan system_instruction jika roleplay tidak kosong
+                    if (!empty($systemRoleplay)) {
+                        $payloadData['system_instruction'] = [
+                            'parts' => [
+                                ['text' => $systemRoleplay]
+                            ]
+                        ];
+                    }
+
+                    $payload = json_encode($payloadData);
 
                     $ch = curl_init();
                     curl_setopt($ch, CURLOPT_URL, $url);
@@ -131,7 +146,7 @@ class ChatGatewayController extends Controller
                     if ($lastHttpCode >= 200 && $lastHttpCode < 300) {
                         $this->keyManager->recordSuccess($apiKeyModel);
                         $success = true;
-                        break 2; // Berhasil! Keluar dari loop key & model
+                        break 2;
                     } else {
                         $lastErrorMessage = $streamBuffer ?: $curlError;
 
